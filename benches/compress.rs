@@ -70,12 +70,12 @@ fn bench_dbtext(c: &mut Criterion) {
 
         group.bench_function("train-and-compress", |b| {
             b.iter_with_large_drop(|| {
-                let compressor = Compressor::train(&vec![&buf]);
-                compressor.compress_bulk(std::hint::black_box(&vec![&buf]))
+                let compressor = Compressor::train(&[&buf]);
+                compressor.compress_bulk(std::hint::black_box(&[&buf]))
             });
         });
 
-        let compressor = Compressor::train(&vec![&buf]);
+        let compressor = Compressor::train(&[&buf]);
         let mut buffer = Vec::with_capacity(200 * 1024 * 1024);
         group.throughput(Throughput::Bytes(buf.len() as u64));
         group.bench_function("compress-only", |b| {
@@ -94,9 +94,9 @@ fn bench_dbtext(c: &mut Criterion) {
 
         // Report the compression factor for this dataset.
         let uncompressed_size = buf.len();
-        let compressor = Compressor::train(&vec![&buf]);
+        let compressor = Compressor::train(&[&buf]);
 
-        let compressed = compressor.compress_bulk(&vec![&buf]);
+        let compressed = compressor.compress_bulk(&[&buf]);
         let compressed_size = compressed.iter().map(|l| l.len()).sum::<usize>();
         let cf = (uncompressed_size as f64) / (compressed_size as f64);
         println!(

@@ -413,7 +413,7 @@ impl Compressor {
     }
 
     /// Compress many lines in bulk.
-    pub fn compress_bulk(&self, lines: &Vec<&[u8]>) -> Vec<Vec<u8>> {
+    pub fn compress_bulk(&self, lines: &[&[u8]]) -> Vec<Vec<u8>> {
         let mut res = Vec::new();
 
         for line in lines {

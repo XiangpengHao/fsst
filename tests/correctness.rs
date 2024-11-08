@@ -49,7 +49,7 @@ fn test_one_byte() {
 #[test]
 fn test_zeros() {
     let training_data: Vec<u8> = vec![0, 1, 2, 3, 4, 0];
-    let trained = Compressor::train(&vec![&training_data]);
+    let trained = Compressor::train(&[&training_data]);
     let compressed = trained.compress(&[4, 0]);
     assert_eq!(trained.decompressor().decompress(&compressed), &[4, 0]);
 }
@@ -59,7 +59,7 @@ fn test_zeros() {
 fn test_large() {
     let corpus: Vec<u8> = DECLARATION.bytes().cycle().take(10_240).collect();
 
-    let trained = Compressor::train(&vec![&corpus]);
+    let trained = Compressor::train(&[&corpus]);
     let massive: Vec<u8> = DECLARATION
         .bytes()
         .cycle()

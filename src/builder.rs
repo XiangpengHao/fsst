@@ -532,7 +532,7 @@ const FSST_SAMPLELINE: usize = 512;
 ///
 /// SAFETY: sample_buf must be >= FSST_SAMPLEMAX bytes long. Providing something less may cause unexpected failures.
 #[allow(clippy::ptr_arg)]
-fn make_sample<'a, 'b: 'a>(sample_buf: &'a mut Vec<u8>, str_in: &Vec<&'b [u8]>) -> Vec<&'a [u8]> {
+fn make_sample<'a, 'b: 'a>(sample_buf: &'a mut Vec<u8>, str_in: &[&'b [u8]]) -> Vec<&'a [u8]> {
     assert!(
         sample_buf.capacity() >= FSST_SAMPLEMAX,
         "sample_buf.len() < FSST_SAMPLEMAX"
@@ -542,7 +542,7 @@ fn make_sample<'a, 'b: 'a>(sample_buf: &'a mut Vec<u8>, str_in: &Vec<&'b [u8]>) 
 
     let tot_size: usize = str_in.iter().map(|s| s.len()).sum();
     if tot_size < FSST_SAMPLETARGET {
-        return str_in.clone();
+        return str_in.to_vec();
     }
 
     let mut sample_rnd = fsst_hash(4637947);
@@ -601,7 +601,7 @@ impl Compressor {
     /// code).
     ///
     /// [FSST paper]: https://www.vldb.org/pvldb/vol13/p2649-boncz.pdf
-    pub fn train(values: &Vec<&[u8]>) -> Self {
+    pub fn train(values: &[&[u8]]) -> Self {
         let mut builder = CompressorBuilder::new();
 
         if values.is_empty() {
@@ -861,7 +861,7 @@ mod test {
         let text = b"hello hello hello hello hello";
 
         // count of 5 is the cutoff for including a symbol in the table.
-        let table = Compressor::train(&vec![text, text, text, text, text]);
+        let table = Compressor::train(&[text, text, text, text, text]);
 
         // Use the table to compress a string, see the values
         let compressed = table.compress(text);
