@@ -10,6 +10,7 @@ macro_rules! assert_sizeof {
 
 use lossy_pht::LossyPHT;
 use std::fmt::{Debug, Formatter};
+use std::mem::MaybeUninit;
 
 mod builder;
 mod lossy_pht;
@@ -250,18 +251,62 @@ impl<'a> Decompressor<'a> {
         Self { symbols, lengths }
     }
 
-    /// Decompress a byte slice that was previously returned by a compressor using
-    /// the same symbol table.
-    pub fn decompress(&self, compressed: &[u8]) -> Vec<u8> {
-        let mut decoded: Vec<u8> = Vec::with_capacity(size_of::<Symbol>() * (compressed.len() + 1));
-        let ptr = decoded.as_mut_ptr();
+    /// Returns an upper bound on the size of the decompressed data.
+    pub fn max_decompression_capacity(&self, compressed: &[u8]) -> usize {
+        size_of::<Symbol>() * (compressed.len() + 1)
+    }
+
+    /// Decompress a slice of codes into a provided buffer.
+    ///
+    /// The provided `decoded` buffer must be at least the size of the decoded data, plus
+    /// an additional 7 bytes.
+    ///
+    /// ## Safety
+    ///
+    /// It is the caller's responsibility to ensure the provided `decoded` slice is large enough to contain
+    /// the decompressed string data. If not, arbitrary memory may be overwritten.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use fsst::{Symbol, Compressor, CompressorBuilder};
+    /// let compressor = {
+    ///     let mut builder = CompressorBuilder::new();
+    ///     builder.insert(Symbol::from_slice(&[b'h', b'e', b'l', b'l', b'o', b'o', b'o', b'o']), 8);
+    ///     builder.build()
+    /// };
+    ///
+    /// let decompressor = compressor.decompressor();
+    ///
+    /// let mut decompressed = Vec::with_capacity(8 + 7);
+    ///
+    /// unsafe {
+    ///     let len = decompressor.decompress_into(&[0], decompressed.spare_capacity_mut());
+    ///     assert_eq!(len, 8);
+    ///     decompressed.set_len(len);
+    /// }
+    /// assert_eq!(&decompressed, "helloooo".as_bytes());
+    /// ```
+    pub unsafe fn decompress_into(
+        &self,
+        compressed: &[u8],
+        decoded: &mut [MaybeUninit<u8>],
+    ) -> usize {
+        // Ensure the target buffer is at least half the size of the input buffer.
+        // This is the theortical smallest a valid target can be, and occurs when
+        // every input code is an escape.
+        assert!(
+            decoded.len() >= compressed.len() / 2,
+            "decoded is smaller than lower-bound decompressed size"
+        );
+        let ptr: *mut u8 = decoded.as_mut_ptr().cast();
 
         let mut in_pos = 0;
         let mut out_pos = 0;
 
         while in_pos < compressed.len() {
             // out_pos can grow at most 8 bytes per iteration, and we start at 0
-            debug_assert!(out_pos <= decoded.capacity() - size_of::<Symbol>());
+            debug_assert!(out_pos <= decoded.len() - size_of::<Symbol>());
             // SAFETY: in_pos is always in range 0..compressed.len()
             let code = unsafe { *compressed.get_unchecked(in_pos) };
             if code == ESCAPE_CODE {
@@ -296,9 +341,17 @@ impl<'a> Decompressor<'a> {
             "decompression should exhaust input before output"
         );
 
-        // SAFETY: we enforce in the loop condition that out_pos <= decoded.capacity()
-        unsafe { decoded.set_len(out_pos) };
+        out_pos
+    }
 
+    /// Decompress a byte slice that was previously returned by a compressor using the same symbol
+    /// table into a new vector of bytes.
+    pub fn decompress(&self, compressed: &[u8]) -> Vec<u8> {
+        let mut decoded = Vec::with_capacity(self.max_decompression_capacity(compressed) + 7);
+
+        // SAFETY: we allocate the maximum decompression memory possible for decoded.
+        let len = unsafe { self.decompress_into(compressed, decoded.spare_capacity_mut()) };
+        unsafe { decoded.set_len(len) };
         decoded
     }
 }
