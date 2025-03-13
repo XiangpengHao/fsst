@@ -261,10 +261,10 @@ impl<'a> Decompressor<'a> {
     /// The provided `decoded` buffer must be at least the size of the decoded data, plus
     /// an additional 7 bytes.
     ///
-    /// ## Safety
+    /// ## Panics
     ///
-    /// It is the caller's responsibility to ensure the provided `decoded` slice is large enough to contain
-    /// the decompressed string data. If not, arbitrary memory may be overwritten.
+    /// If the caller fails to provide sufficient capacity in the decoded buffer. An upper bound
+    /// on the required capacity can be obtained by calling [`Self::max_decompression_capacity`].
     ///
     /// ## Example
     ///
@@ -280,18 +280,12 @@ impl<'a> Decompressor<'a> {
     ///
     /// let mut decompressed = Vec::with_capacity(8 + 7);
     ///
-    /// unsafe {
-    ///     let len = decompressor.decompress_into(&[0], decompressed.spare_capacity_mut());
-    ///     assert_eq!(len, 8);
-    ///     decompressed.set_len(len);
-    /// }
+    /// let len = decompressor.decompress_into(&[0], decompressed.spare_capacity_mut());
+    /// assert_eq!(len, 8);
+    /// unsafe { decompressed.set_len(len) };
     /// assert_eq!(&decompressed, "helloooo".as_bytes());
     /// ```
-    pub unsafe fn decompress_into(
-        &self,
-        compressed: &[u8],
-        decoded: &mut [MaybeUninit<u8>],
-    ) -> usize {
+    pub fn decompress_into(&self, compressed: &[u8], decoded: &mut [MaybeUninit<u8>]) -> usize {
         // Ensure the target buffer is at least half the size of the input buffer.
         // This is the theortical smallest a valid target can be, and occurs when
         // every input code is an escape.
@@ -299,49 +293,205 @@ impl<'a> Decompressor<'a> {
             decoded.len() >= compressed.len() / 2,
             "decoded is smaller than lower-bound decompressed size"
         );
-        let ptr: *mut u8 = decoded.as_mut_ptr().cast();
 
-        let mut in_pos = 0;
-        let mut out_pos = 0;
+        unsafe {
+            let mut in_ptr = compressed.as_ptr();
+            let _in_begin = in_ptr;
+            let in_end = in_ptr.add(compressed.len());
 
-        while in_pos < compressed.len() {
-            // out_pos can grow at most 8 bytes per iteration, and we start at 0
-            debug_assert!(out_pos <= decoded.len() - size_of::<Symbol>());
-            // SAFETY: in_pos is always in range 0..compressed.len()
-            let code = unsafe { *compressed.get_unchecked(in_pos) };
-            if code == ESCAPE_CODE {
-                // Advance by one, do raw write.
-                in_pos += 1;
-                // SAFETY: out_pos is always 8 bytes or more from the end of decoded buffer
-                // SAFETY: ESCAPE_CODE can not be the last byte of the compressed stream
-                unsafe {
-                    let write_addr = ptr.byte_add(out_pos);
-                    std::ptr::write(write_addr, *compressed.get_unchecked(in_pos));
-                }
-                out_pos += 1;
-                in_pos += 1;
-            } else {
-                // SAFETY: code is in range 0..255
-                // The symbol and length tables are both of length 256, so this is safe.
-                let symbol = unsafe { *self.symbols.get_unchecked(code as usize) };
-                let length = unsafe { *self.lengths.get_unchecked(code as usize) };
-                // SAFETY: out_pos is always 8 bytes or more from the end of decoded buffer
-                unsafe {
-                    let write_addr = ptr.byte_add(out_pos) as *mut u64;
-                    // Perform 8 byte unaligned write.
-                    write_addr.write_unaligned(symbol.as_u64());
-                }
-                in_pos += 1;
-                out_pos += length as usize;
+            let mut out_ptr: *mut u8 = decoded.as_mut_ptr().cast();
+            let out_begin = out_ptr.cast_const();
+            let out_end = decoded.as_ptr().add(decoded.len()).cast::<u8>();
+
+            macro_rules! store_next_symbol {
+                ($code:expr) => {{
+                    out_ptr
+                        .cast::<u64>()
+                        .write_unaligned(self.symbols.get_unchecked($code as usize).as_u64());
+                    out_ptr = out_ptr.add(*self.lengths.get_unchecked($code as usize) as usize);
+                }};
             }
+
+            // First we try loading 8 bytes at a time.
+            if decoded.len() >= 8 * size_of::<Symbol>() && compressed.len() >= 8 {
+                // Extract the loop condition since the compiler fails to do so
+                let block_out_end = out_end.sub(8 * size_of::<Symbol>());
+                let block_in_end = in_end.sub(8);
+
+                while out_ptr.cast_const() <= block_out_end && in_ptr < block_in_end {
+                    // Note that we load a little-endian u64 here.
+                    let next_block = in_ptr.cast::<u64>().read_unaligned();
+                    let escape_mask = (next_block & 0x8080808080808080)
+                        & ((((!next_block) & 0x7F7F7F7F7F7F7F7F) + 0x7F7F7F7F7F7F7F7F)
+                            ^ 0x8080808080808080);
+
+                    // If there are no escape codes, we write each symbol one by one.
+                    if escape_mask == 0 {
+                        let code = (next_block & 0xFF) as u8;
+                        store_next_symbol!(code);
+                        let code = ((next_block >> 8) & 0xFF) as u8;
+                        store_next_symbol!(code);
+                        let code = ((next_block >> 16) & 0xFF) as u8;
+                        store_next_symbol!(code);
+                        let code = ((next_block >> 24) & 0xFF) as u8;
+                        store_next_symbol!(code);
+                        let code = ((next_block >> 32) & 0xFF) as u8;
+                        store_next_symbol!(code);
+                        let code = ((next_block >> 40) & 0xFF) as u8;
+                        store_next_symbol!(code);
+                        let code = ((next_block >> 48) & 0xFF) as u8;
+                        store_next_symbol!(code);
+                        let code = ((next_block >> 56) & 0xFF) as u8;
+                        store_next_symbol!(code);
+                        in_ptr = in_ptr.add(8);
+                    } else {
+                        // Otherwise, find the first escape code and write the symbols up to that point.
+                        let first_escape_pos = escape_mask.trailing_zeros() >> 3; // Divide bits to bytes
+                        debug_assert!(first_escape_pos < 8);
+                        match first_escape_pos {
+                            7 => {
+                                let code = (next_block & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 8) & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 16) & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 24) & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 32) & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 40) & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 48) & 0xFF) as u8;
+                                store_next_symbol!(code);
+
+                                in_ptr = in_ptr.add(7);
+                            }
+                            6 => {
+                                let code = (next_block & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 8) & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 16) & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 24) & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 32) & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 40) & 0xFF) as u8;
+                                store_next_symbol!(code);
+
+                                let escaped = ((next_block >> 56) & 0xFF) as u8;
+                                out_ptr.write(escaped);
+                                out_ptr = out_ptr.add(1);
+
+                                in_ptr = in_ptr.add(8);
+                            }
+                            5 => {
+                                let code = (next_block & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 8) & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 16) & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 24) & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 32) & 0xFF) as u8;
+                                store_next_symbol!(code);
+
+                                let escaped = ((next_block >> 48) & 0xFF) as u8;
+                                out_ptr.write(escaped);
+                                out_ptr = out_ptr.add(1);
+
+                                in_ptr = in_ptr.add(7);
+                            }
+                            4 => {
+                                let code = (next_block & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 8) & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 16) & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 24) & 0xFF) as u8;
+                                store_next_symbol!(code);
+
+                                let escaped = ((next_block >> 40) & 0xFF) as u8;
+                                out_ptr.write(escaped);
+                                out_ptr = out_ptr.add(1);
+
+                                in_ptr = in_ptr.add(6);
+                            }
+                            3 => {
+                                let code = (next_block & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 8) & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 16) & 0xFF) as u8;
+                                store_next_symbol!(code);
+
+                                let escaped = ((next_block >> 32) & 0xFF) as u8;
+                                out_ptr.write(escaped);
+                                out_ptr = out_ptr.add(1);
+
+                                in_ptr = in_ptr.add(5);
+                            }
+                            2 => {
+                                let code = (next_block & 0xFF) as u8;
+                                store_next_symbol!(code);
+                                let code = ((next_block >> 8) & 0xFF) as u8;
+                                store_next_symbol!(code);
+
+                                let escaped = ((next_block >> 24) & 0xFF) as u8;
+                                out_ptr.write(escaped);
+                                out_ptr = out_ptr.add(1);
+
+                                in_ptr = in_ptr.add(4);
+                            }
+                            1 => {
+                                let code = (next_block & 0xFF) as u8;
+                                store_next_symbol!(code);
+
+                                let escaped = ((next_block >> 16) & 0xFF) as u8;
+                                out_ptr.write(escaped);
+                                out_ptr = out_ptr.add(1);
+
+                                in_ptr = in_ptr.add(3);
+                            }
+                            0 => {
+                                // Otherwise, we actually need to decompress the next byte
+                                // Extract the second byte from the u32
+                                let escaped = ((next_block >> 8) & 0xFF) as u8;
+                                in_ptr = in_ptr.add(2);
+                                out_ptr.write(escaped);
+                                out_ptr = out_ptr.add(1);
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            }
+
+            // Otherwise, fall back to 1-byte reads.
+            while out_end.offset_from(out_ptr) > size_of::<Symbol>() as isize && in_ptr < in_end {
+                let code = in_ptr.read();
+                in_ptr = in_ptr.add(1);
+
+                if code == ESCAPE_CODE {
+                    out_ptr.write(in_ptr.read());
+                    in_ptr = in_ptr.add(1);
+                    out_ptr = out_ptr.add(1);
+                } else {
+                    store_next_symbol!(code);
+                }
+            }
+
+            assert_eq!(
+                in_ptr, in_end,
+                "decompression should exhaust input before output"
+            );
+
+            out_ptr.offset_from(out_begin) as usize
         }
-
-        assert!(
-            in_pos >= compressed.len(),
-            "decompression should exhaust input before output"
-        );
-
-        out_pos
     }
 
     /// Decompress a byte slice that was previously returned by a compressor using the same symbol
@@ -349,8 +499,8 @@ impl<'a> Decompressor<'a> {
     pub fn decompress(&self, compressed: &[u8]) -> Vec<u8> {
         let mut decoded = Vec::with_capacity(self.max_decompression_capacity(compressed) + 7);
 
-        // SAFETY: we allocate the maximum decompression memory possible for decoded.
-        let len = unsafe { self.decompress_into(compressed, decoded.spare_capacity_mut()) };
+        let len = self.decompress_into(compressed, decoded.spare_capacity_mut());
+        // SAFETY: len bytes have now been initialized by the decompressor.
         unsafe { decoded.set_len(len) };
         decoded
     }
@@ -621,4 +771,26 @@ pub(crate) fn advance_8byte_word(word: u64, bytes: usize) -> u64 {
 pub(crate) fn compare_masked(left: u64, right: u64, ignored_bits: u16) -> bool {
     let mask = u64::MAX >> ignored_bits;
     (left & mask) == right
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    #[test]
+    fn test_stuff() {
+        let compressor = {
+            let mut builder = CompressorBuilder::new();
+            builder.insert(Symbol::from_slice(b"helloooo"), 8);
+            builder.build()
+        };
+
+        let decompressor = compressor.decompressor();
+
+        let mut decompressed = Vec::with_capacity(8 + 7);
+
+        let len = decompressor.decompress_into(&[0], decompressed.spare_capacity_mut());
+        assert_eq!(len, 8);
+        unsafe { decompressed.set_len(len) };
+        assert_eq!(&decompressed, "helloooo".as_bytes());
+    }
 }

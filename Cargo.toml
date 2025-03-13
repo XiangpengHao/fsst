@@ -1,6 +1,6 @@
 [package]
 name = "fsst-rs"
-version = "0.5.0"
+version = "0.5.1"
 description = "Pure-Rust implementation of Fast Static Symbol Tables algorithm for string compression"
 authors = ["SpiralDB Developers <hello@spiraldb.com>"]
 license = "Apache-2.0"
@@ -26,7 +26,7 @@ unwrap_in_result = { level = "deny" }
 use_debug = { level = "deny" }
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = { package = "codspeed-criterion-compat", version = "2.8" }
 curl = "0.4"
 
 [[example]]
